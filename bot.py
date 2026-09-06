@@ -120,15 +120,22 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Advertising / Links regex
-AD_PATTERN = re.compile(
-    r"(?i)(?:https?://|www\.|t\.me/|telegram\.me/|@[a-zA-Z0-9_]+)"
-)
+# Regex patterns for URL and username detection
+URL_PATTERN = re.compile(r"(?i)(https?://\S+|t\.me/\S+|telegram\.me/\S+)")
+MENTION_PATTERN = re.compile(r"@[a-zA-Z0-9_]{5,}")
 
 BLOCKED_ENTITY_TYPES = {
     MessageEntityType.URL,
     MessageEntityType.TEXT_LINK,
     MessageEntityType.MENTION,
+}
+
+# Whitelisted link identifiers
+WHITELISTED_LINKS = {
+    "qa_test_community",
+    "t.me/qa_test_community",
+    f"t.me/{BOT_USERNAME}".lower(),
+    BOT_USERNAME.lower(),
 }
 
 # Configurable profanity dictionary
@@ -146,9 +153,6 @@ HOMOGLYPHS = {
     "@": "a", "0": "o", "1": "i", "!": "i", "$": "s", "3": "e", "4": "a"
 }
 
-# In-memory caches for anti-flood and temporary states
-_recent_welcomes: dict[tuple[int, int], float] = {}
-_user_warnings: dict[tuple[int, int], int] = {}
 _registered_admins: set[int] = set()
 
 if ENV_ADMIN_ID and ENV_ADMIN_ID.isdigit():
@@ -181,17 +185,8 @@ def contains_profanity(text: str) -> bool:
     return False
 
 
-def format_user_mention(user: TgUser) -> str:
-    """Format user with Telegram profile link and optional username."""
-    safe_name = html.escape(user.full_name)
-    mention_link = f'<a href="tg://user?id={user.id}">{safe_name}</a>'
-    if user.username:
-        return f"{mention_link} (@{user.username})"
-    return mention_link
-
-
 async def is_admin(message: Message, bot_instance: Bot) -> bool:
-    """Check if the sender is an administrator or creator."""
+    """Check if the message sender is an administrator or creator."""
     if message.from_user is None:
         if message.sender_chat and message.sender_chat.id == message.chat.id:
             return True
@@ -206,15 +201,31 @@ async def is_admin(message: Message, bot_instance: Bot) -> bool:
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
         }
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         return False
     except Exception as exc:
         logger.warning("Admin check failed: %s", exc)
         return False
 
 
+async def is_admin_user(chat_id: int, user_id: int, bot_instance: Bot) -> bool:
+    """Check if a specific user ID is an administrator or creator in a chat."""
+    try:
+        member = await bot_instance.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status in {
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR,
+        }
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
+    except Exception as exc:
+        logger.warning("Admin check failed for user %s in chat %s: %s", user_id, chat_id, exc)
+        return False
+
+
 def is_ad_or_violating(message: Message) -> bool:
-    """Check if message has links, ads, mentions, or forwards from channels/bots."""
+    """Check if message contains unauthorized advertisements, links, or username tags."""
+    # Check forwards from channels/chats or bots
     if message.forward_origin is not None:
         if isinstance(message.forward_origin, (MessageOriginChannel, MessageOriginChat)):
             return True
@@ -224,14 +235,39 @@ def is_ad_or_violating(message: Message) -> bool:
         ):
             return True
 
+    text_to_check = f"{message.text or ''}\n{message.caption or ''}".strip()
     entities = (message.entities or []) + (message.caption_entities or [])
+
+    # Check Telegram message entities
     for entity in entities:
         if entity.type in BLOCKED_ENTITY_TYPES:
+            if entity.url:
+                url_clean = entity.url.lower().replace("https://", "").replace("http://", "").strip("/")
+                if any(w in url_clean for w in WHITELISTED_LINKS if w):
+                    continue
+                return True
+
+            if text_to_check:
+                entity_text = text_to_check[entity.offset:entity.offset + entity.length] if entity.offset + entity.length <= len(text_to_check) else ""
+                clean_ent = entity_text.lower().replace("https://", "").replace("http://", "").replace("@", "").strip("/")
+                if clean_ent and any(w == clean_ent or f"t.me/{clean_ent}" == w for w in WHITELISTED_LINKS if w):
+                    continue
             return True
 
-    content = f"{message.text or ''}\n{message.caption or ''}"
-    if AD_PATTERN.search(content):
-        return True
+    if not text_to_check:
+        return False
+
+    # Regex search for links
+    for match in URL_PATTERN.finditer(text_to_check):
+        matched_str = match.group(0).lower().replace("https://", "").replace("http://", "").strip("/")
+        if not any(w in matched_str for w in WHITELISTED_LINKS if w):
+            return True
+
+    # Regex search for username tags
+    for match in MENTION_PATTERN.finditer(text_to_check):
+        mention_str = match.group(0).lower().lstrip("@")
+        if mention_str not in {w.lstrip("@").lower() for w in WHITELISTED_LINKS if w}:
+            return True
 
     return False
 
@@ -241,7 +277,7 @@ async def delete_after_delay(msg: Message, delay: int = 30) -> None:
     await asyncio.sleep(delay)
     try:
         await msg.delete()
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
     except Exception as exc:
         logger.debug("Failed to auto-delete temporary message: %s", exc)
@@ -273,6 +309,24 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
                     url="https://t.me/qa_test_community",
                 )
             ],
+        ]
+    )
+
+
+def get_ad_warning_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Generate interactive action keyboard for anti-ad warning."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🚫 Bloklash",
+                    callback_data=f"ban_{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 Xabarni o'chirish",
+                    callback_data="delete_guard_msg",
+                ),
+            ]
         ]
     )
 
@@ -336,7 +390,7 @@ async def get_top_referrals_text() -> str:
     return "\n".join(lines)
 
 
-# ------------------ 2. SANOQCHI / REFERRAL SYSTEM (PRIVATE CHAT) ------------------ #
+# ------------------ SANOQCHI / REFERRAL SYSTEM (PRIVATE CHAT) ------------------ #
 
 @dp.message(F.chat.type == ChatType.PRIVATE, CommandStart())
 async def handle_start_private(message: Message, command: CommandObject, bot: Bot) -> None:
@@ -479,6 +533,63 @@ async def cmd_top(message: Message) -> None:
     await message.answer(text)
 
 
+# ------------------ INTERACTIVE ADMIN CONTROLS (ANTI-AD / LINK) ------------------ #
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def cb_ban_user(callback: CallbackQuery, bot: Bot) -> None:
+    """Interactive admin action to ban a violator."""
+    if not callback.message or not callback.from_user:
+        return
+
+    chat_id = callback.message.chat.id
+    admin_id = callback.from_user.id
+
+    # Security check: verify admin status
+    if not await is_admin_user(chat_id, admin_id, bot):
+        await callback.answer("⚠️ Bu tugma faqat guruh adminlari uchun!", show_alert=True)
+        return
+
+    try:
+        target_user_id = int(callback.data.split("_")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Xatolik yuz berdi!", show_alert=True)
+        return
+
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=target_user_id)
+        await callback.answer("Foydalanuvchi guruhdan chetlatildi!", show_alert=False)
+        await callback.message.edit_text(
+            "👤 <b>Qoidabuzar admin tomonidan guruhdan chetlatildi.</b>",
+            reply_markup=None,
+        )
+        logger.info("User %s banned by admin %s in chat %s", target_user_id, admin_id, chat_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.warning("Failed to ban user %s in chat %s: %s", target_user_id, chat_id, exc)
+        await callback.answer("⚠️ Xatolik: Botda a'zolarni chetlatish (Ban) huquqi yo'q!", show_alert=True)
+
+
+@dp.callback_query(F.data == "delete_guard_msg")
+async def cb_delete_guard_msg(callback: CallbackQuery, bot: Bot) -> None:
+    """Interactive admin action to delete the guard warning message."""
+    if not callback.message or not callback.from_user:
+        return
+
+    chat_id = callback.message.chat.id
+    admin_id = callback.from_user.id
+
+    # Security check: verify admin status
+    if not await is_admin_user(chat_id, admin_id, bot):
+        await callback.answer("⚠️ Bu tugma faqat guruh adminlari uchun!", show_alert=True)
+        return
+
+    try:
+        await callback.message.delete()
+        await callback.answer()
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.debug("Failed to delete guard message: %s", exc)
+        await callback.answer("Xabarni o'chirib bo'lmadi.", show_alert=False)
+
+
 # ------------------ ADMIN MODERATION COMMANDS ------------------ #
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), Command("unmute"))
@@ -517,7 +628,6 @@ async def handle_unmute_command(message: Message, bot: Bot) -> None:
             user_id=target_user.id,
             permissions=full_permissions,
         )
-        _user_warnings[(message.chat.id, target_user.id)] = 0
         safe_name = html.escape(target_user.full_name)
         await message.reply(
             f"✅ <a href=\"tg://user?id={target_user.id}\">{safe_name}</a> dan cheklov (mute) olib tashlandi!"
@@ -526,16 +636,19 @@ async def handle_unmute_command(message: Message, bot: Bot) -> None:
         await message.reply(f"Xatolik: {exc}")
 
 
-# ------------------ 3. GROUP GUARDIAN / PROFANITY FILTER ------------------ #
+# ------------------ GROUP GUARDIAN / MODERATION ENGINE ------------------ #
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def handle_group_message(message: Message, bot: Bot) -> None:
-    """Handle group messages: profanity filtering, anti-ad protection, and auto-reactions."""
-    is_user_admin = await is_admin(message, bot)
+    """Handle group messages: profanity filtering, anti-link / advertisement protection, and auto-reactions."""
+    # Exclude messages sent by group Administrators or bots
+    if await is_admin(message, bot) or (message.from_user and message.from_user.is_bot):
+        return
+
     text_content = f"{message.text or ''} {message.caption or ''}".strip()
 
     # --- 1. PROFANITY & TOXICITY FILTER ENGINE ---
-    if not is_user_admin and text_content and contains_profanity(text_content):
+    if text_content and contains_profanity(text_content):
         # 1. Delete the profane message immediately
         try:
             await message.delete()
@@ -594,49 +707,37 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
 
         return
 
-    # --- 2. ANTI-AD & LINK PROTECTION ---
-    if not is_user_admin and is_ad_or_violating(message):
+    # --- 2. ADVANCED ANTI-LINK & ANTI-ADVERTISEMENT ENGINE ---
+    if is_ad_or_violating(message):
+        # Step 1: Immediately delete the offending advertisement message
         try:
             await message.delete()
-            logger.info("Deleted ad/link message in chat %s", message.chat.id)
+            logger.info("Deleted ad/link message from user %s in chat %s", message.from_user.id if message.from_user else "unknown", message.chat.id)
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.warning("Failed to delete ad message: %s", exc)
 
         if message.from_user:
             user = message.from_user
-            warn_key = (message.chat.id, user.id)
-            current_warns = _user_warnings.get(warn_key, 0) + 1
-            user_mention = format_user_mention(user)
+            user_id = user.id
+            user_full_name = html.escape(user.full_name)
 
-            if current_warns >= 3:
-                _user_warnings[warn_key] = 0
-                mute_until = datetime.now(timezone.utc) + timedelta(hours=24)
-                restricted_permissions = ChatPermissions(can_send_messages=False)
-                try:
-                    await bot.restrict_chat_member(
-                        chat_id=message.chat.id,
-                        user_id=user.id,
-                        permissions=restricted_permissions,
-                        until_date=mute_until,
-                    )
-                    punish_text = (
-                        f"🚫 {user_mention} <b>3 marta</b> qoidani buzgani sababli "
-                        f"<b>24 soatga</b> guruhda yozish huquqidan mahrum qilindi (MUTE)!"
-                    )
-                    await bot.send_message(chat_id=message.chat.id, text=punish_text)
-                except (TelegramBadRequest, TelegramForbiddenError) as exc:
-                    logger.warning("Failed to restrict user: %s", exc)
-            else:
-                _user_warnings[warn_key] = current_warns
-                warn_text = (
-                    f"⚠️ {user_mention}, guruhda reklama va havola yuborish taqiqlangan!\n"
-                    f"Ogohlantirish: <b>{current_warns}/3</b>\n"
-                    f"<i>(3-ogohlantirishdan so'ng 24 soatga yozish huquqidan mahrum qilinasiz)</i>"
+            # Step 2: Dedicated warning message tagging the offender
+            warning_text = (
+                f"⚠️ <b>Hurmatli <a href=\"tg://user?id={user_id}\">{user_full_name}</a>, guruhda reklama tarqatmang!</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "🚫 Reklama, havola va kanallar targ'iboti taqiqlangan.\n"
+                "⚖️ Qoidalarni takroran buzsangiz, guruhdan butunlay chetlatilasiz!"
+            )
+
+            # Step 3: Attach Inline Keyboard with admin action buttons
+            try:
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=warning_text,
+                    reply_markup=get_ad_warning_keyboard(user_id),
                 )
-                try:
-                    await bot.send_message(chat_id=message.chat.id, text=warn_text)
-                except (TelegramBadRequest, TelegramForbiddenError) as exc:
-                    logger.warning("Failed to send link warning: %s", exc)
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                logger.warning("Failed to send ad warning message: %s", exc)
 
         return
 
