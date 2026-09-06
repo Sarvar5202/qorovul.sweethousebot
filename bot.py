@@ -50,7 +50,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8607841082:AAG4XXxHtjuCE2NOhv2ke9nyp7z49rLqoJE")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "qorovul_sweethousebot")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "qorovul_sweethousebot").strip().lstrip("@")
 ENV_ADMIN_ID = os.getenv("ADMIN_ID")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -134,8 +134,12 @@ BLOCKED_ENTITY_TYPES = {
 WHITELISTED_LINKS = {
     "qa_test_community",
     "t.me/qa_test_community",
+    "qorovul_sweethousebot",
+    "@qorovul_sweethousebot",
+    "t.me/qorovul_sweethousebot",
     f"t.me/{BOT_USERNAME}".lower(),
     BOT_USERNAME.lower(),
+    f"@{BOT_USERNAME}".lower(),
 }
 
 # Configurable profanity dictionary
