@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import html
-import json
 import logging
 import os
 import re
@@ -12,9 +11,10 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.types import (
+    CallbackQuery,
     ChatMemberUpdated,
     ChatPermissions,
     InlineKeyboardButton,
@@ -24,26 +24,45 @@ from aiogram.types import (
     MessageOriginChat,
     MessageOriginUser,
     ReactionTypeEmoji,
-    User,
+    User as TgUser,
 )
+from dotenv import load_dotenv
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    desc,
+    func,
+    select,
+    update,
+)
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# Load environment variables (.env)
-def load_dotenv(filepath: str = ".env") -> None:
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+# ------------------ CONFIGURATION & ENVIRONMENT ------------------ #
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8607841082:AAG4XXxHtjuCE2NOhv2ke9nyp7z49rLqoJE")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "qorovul_sweethousebot")
 ENV_ADMIN_ID = os.getenv("ADMIN_ID")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-USERS_FILE = "registered_admins.json"
+# Automatically format connection scheme for asyncpg
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+asyncpg://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    # Fallback to local SQLite async database for development/standalone run if PostgreSQL is not specified
+    DATABASE_URL = "sqlite+aiosqlite:///bot.db"
 
 # Logging configuration
 logging.basicConfig(
@@ -53,14 +72,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Bot & Dispatcher
+# ------------------ DATABASE MODELS & SESSION ------------------ #
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    invites_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), default=func.now())
+
+
+class Referral(Base):
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    referrer_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    referred_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), default=func.now())
+
+
+# Async Engine & SessionMaker
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+async def init_db() -> None:
+    """Initialize database tables on startup."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables initialized successfully on %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL)
+
+
+# ------------------ BOT INITIALIZATION ------------------ #
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
 
-# Regex pattern for advertising/links
+# Advertising / Links regex
 AD_PATTERN = re.compile(
     r"(?i)(?:https?://|www\.|t\.me/|telegram\.me/|@[a-zA-Z0-9_]+)"
 )
@@ -73,19 +133,20 @@ BLOCKED_ENTITY_TYPES = {
 
 # Configurable profanity dictionary
 PROFANITY_WORDS = {
+    "ahmoq", "tentak", "mol", "itvachcha", "harom", "chumo", "jallob", "iflos",
     "jalap", "jalab", "haromi", "xaromi", "sikay", "sikey", "skay", "skey",
     "sikaman", "sikish", "koting", "kot", "koti", "am", "oming", "omi",
-    "qotoq", "qotoqbosh", "qotoqvoy", "dalbayob", "dalbaeb", "itvachcha",
-    "shilta", "chmo", "la'nati", "lanati", "onangni", "padariga", "oneni",
-    "suka", "blyad", "blat", "gandon", "pidar", "pidaraz", "tvar"
+    "qotoq", "qotoqbosh", "qotoqvoy", "dalbayob", "dalbaeb", "shilta", "chmo",
+    "la'nati", "lanati", "onangni", "padariga", "oneni", "suka", "blyad",
+    "blat", "gandon", "pidar", "pidaraz", "tvar"
 }
 
-# Leetspeak / Homoglyph mapping for normalization
+# Leetspeak / Homoglyph mapping
 HOMOGLYPHS = {
     "@": "a", "0": "o", "1": "i", "!": "i", "$": "s", "3": "e", "4": "a"
 }
 
-# In-memory caches
+# In-memory caches for anti-flood and temporary states
 _recent_welcomes: dict[tuple[int, int], float] = {}
 _user_warnings: dict[tuple[int, int], int] = {}
 _registered_admins: set[int] = set()
@@ -93,26 +154,8 @@ _registered_admins: set[int] = set()
 if ENV_ADMIN_ID and ENV_ADMIN_ID.isdigit():
     _registered_admins.add(int(ENV_ADMIN_ID))
 
-def load_registered_admins() -> None:
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    _registered_admins.update(data)
-        except Exception as exc:
-            logger.warning("Could not read %s: %s", USERS_FILE, exc)
 
-def save_registered_admin(user_id: int) -> None:
-    _registered_admins.add(user_id)
-    try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(_registered_admins), f)
-    except Exception as exc:
-        logger.warning("Could not save %s: %s", USERS_FILE, exc)
-
-load_registered_admins()
-
+# ------------------ HELPER FUNCTIONS ------------------ #
 
 def normalize_text(text: str) -> str:
     """Normalize text by converting to lower case and replacing common homoglyphs."""
@@ -123,20 +166,22 @@ def normalize_text(text: str) -> str:
 
 
 def contains_profanity(text: str) -> bool:
-    """Detect profanity words in normalized text."""
+    """Detect profanity words in normalized text with token and substring matching."""
     if not text:
         return False
     normalized = normalize_text(text)
-    tokens = set(re.findall(r"\b\w+\b", normalized))
+    tokens = set(re.findall(r"\b\w+\b", normalized, re.UNICODE))
     if tokens & PROFANITY_WORDS:
         return True
     for bad_word in PROFANITY_WORDS:
-        if len(bad_word) >= 3 and bad_word in normalized:
+        if len(bad_word) >= 4 and bad_word in normalized:
+            return True
+        elif bad_word in tokens:
             return True
     return False
 
 
-def format_user_mention(user: User) -> str:
+def format_user_mention(user: TgUser) -> str:
     """Format user with Telegram profile link and optional username."""
     safe_name = html.escape(user.full_name)
     mention_link = f'<a href="tg://user?id={user.id}">{safe_name}</a>'
@@ -202,72 +247,178 @@ async def delete_after_delay(msg: Message, delay: int = 30) -> None:
         logger.debug("Failed to auto-delete temporary message: %s", exc)
 
 
-async def send_new_member_card_to_private(chat_id: int, chat_title: str, user: User, bot_instance: Bot) -> None:
-    """Send structured join notification card directly to the bot's private chat (admin chat)."""
-    if user.is_bot:
-        return
-
-    now = time.time()
-    for key, ts in list(_recent_welcomes.items()):
-        if now - ts > 60:
-            _recent_welcomes.pop(key, None)
-
-    cache_key = (chat_id, user.id)
-    if cache_key in _recent_welcomes and (now - _recent_welcomes[cache_key]) < 15:
-        return
-    _recent_welcomes[cache_key] = now
-
-    safe_name = html.escape(user.full_name)
-    username_str = f"@{user.username}" if user.username else "Mavjud emas"
-    safe_title = html.escape(chat_title or "Guruh")
-    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    join_card_text = (
-        "🔔 <b>Guruhga yangi a'zo qo'shildi!</b>\n\n"
-        f"👥 <b>Guruh:</b> {safe_title}\n"
-        f"👤 <b>Foydalanuvchi:</b> <a href=\"tg://user?id={user.id}\">{safe_name}</a>\n"
-        f"🔗 <b>Username:</b> {username_str}\n"
-        f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
-        f"📅 <b>Vaqt:</b> {current_time_str}\n"
-        "🛡 <b>Status:</b> Kanal obunasi va Bot tekshiruviga yuborildi."
+def get_main_keyboard() -> InlineKeyboardMarkup:
+    """Generate main inline keyboard for private chat /start UI."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Guruhga qo'shish",
+                    url=f"https://t.me/{BOT_USERNAME}?startgroup=true",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Mening hisobim",
+                    callback_data="my_stats",
+                ),
+                InlineKeyboardButton(
+                    text="🏆 Top taklifchilar",
+                    callback_data="top_referrals",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Qo'llab-quvvatlash",
+                    url="https://t.me/qa_test_community",
+                )
+            ],
+        ]
     )
 
-    # Gather target recipient IDs (group creator/admins and registered private users)
-    recipients = set(_registered_admins)
 
+async def get_user_stats_text(user_id: int, user_name: str) -> str:
+    """Fetch user stats from database and return formatted text card."""
+    invites_count = 0
     try:
-        admins = await bot_instance.get_chat_administrators(chat_id=chat_id)
-        for admin in admins:
-            if not admin.user.is_bot:
-                recipients.add(admin.user.id)
+        async with async_session() as session:
+            result = await session.execute(select(User).where(User.user_id == user_id))
+            user_row = result.scalar_one_or_none()
+            if user_row:
+                invites_count = user_row.invites_count
     except Exception as exc:
-        logger.debug("Could not get chat administrators for chat %s: %s", chat_id, exc)
+        logger.error("Error querying user stats for %s: %s", user_id, exc)
 
-    # Send join notification card to bot's private chats
-    for admin_id in recipients:
-        try:
-            await bot_instance.send_message(chat_id=admin_id, text=join_card_text)
-            logger.info("Sent join log to private chat of user %s", admin_id)
-        except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            logger.debug("Could not send private notification to %s (user hasn't started bot in private): %s", admin_id, exc)
-        except Exception as exc:
-            logger.warning("Error sending private notification: %s", exc)
+    ref_link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
+    safe_name = html.escape(user_name)
+    return (
+        "📊 <b>Sizning hisobingiz:</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Foydalanuvchi:</b> {safe_name}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+        f"👥 <b>Taklif qilgan do‘stlaringiz:</b> <b>{invites_count}</b> ta\n\n"
+        "🔗 <b>Sizning taklif havolangiz:</b>\n"
+        f"<code>{ref_link}</code>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Ushbu havolani do‘stlaringizga yuboring va ball to‘plang!</i>"
+    )
 
 
-# ------------------ /start COMMAND HANDLER ------------------ #
+async def get_top_referrals_text() -> str:
+    """Fetch top 10 inviters from database and return formatted leaderboard."""
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(User).order_by(desc(User.invites_count), User.created_at.asc()).limit(10)
+            )
+            top_users = result.scalars().all()
+    except Exception as exc:
+        logger.error("Error querying top referrals: %s", exc)
+        top_users = []
+
+    if not top_users:
+        return (
+            "🏆 <b>TOP 10 Taklifchilar reytingi:</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "Hozircha reytingda hech kim yo‘q.\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "⚖️ <i>Do‘stlaringizni taklif qiling va 1-o‘rinni egallang!</i>"
+        )
+
+    lines = ["🏆 <b>TOP 10 Taklifchilar reytingi:</b>", "━━━━━━━━━━━━━━━━━"]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for idx, u in enumerate(top_users, start=1):
+        prefix = medals.get(idx, f"<b>{idx}.</b>")
+        safe_name = html.escape(u.full_name)
+        lines.append(f"{prefix} {safe_name} — <b>{u.invites_count}</b> ta")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("⚖️ <i>Do‘stlaringizni taklif qiling va yetakchiga aylaning!</i>")
+    return "\n".join(lines)
+
+
+# ------------------ 2. SANOQCHI / REFERRAL SYSTEM (PRIVATE CHAT) ------------------ #
 
 @dp.message(F.chat.type == ChatType.PRIVATE, CommandStart())
-async def handle_start_private(message: Message) -> None:
-    """Handle /start command in private chats with modern UX and action buttons."""
-    if message.from_user:
-        save_registered_admin(message.from_user.id)
+async def handle_start_private(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Handle /start command in private chats with deep-link referral counter & UI card."""
+    if not message.from_user:
+        return
 
-    user_name = html.escape(message.from_user.full_name) if message.from_user else "Foydalanuvchi"
-    
+    user_id = message.from_user.id
+    full_name = message.from_user.full_name
+    safe_user_name = html.escape(full_name)
+    _registered_admins.add(user_id)
+
+    referrer_arg = command.args.strip() if command.args else None
+    referrer_to_notify = None
+    new_invites_count = 0
+
+    try:
+        async with async_session() as session:
+            async with session.begin():
+                # 1. Check if incoming user exists in database
+                result = await session.execute(select(User).where(User.user_id == user_id))
+                existing_user = result.scalar_one_or_none()
+
+                if existing_user is None:
+                    # New user flow
+                    referrer_id = None
+                    if referrer_arg and referrer_arg.isdigit():
+                        parsed_ref_id = int(referrer_arg)
+                        if parsed_ref_id != user_id:
+                            ref_res = await session.execute(
+                                select(User).where(User.user_id == parsed_ref_id)
+                            )
+                            referrer_user = ref_res.scalar_one_or_none()
+                            if referrer_user:
+                                referrer_id = parsed_ref_id
+                                referrer_user.invites_count += 1
+                                new_invites_count = referrer_user.invites_count
+                                referrer_to_notify = referrer_id
+
+                    # Register new user in users
+                    new_user = User(
+                        user_id=user_id,
+                        full_name=full_name,
+                        invites_count=0,
+                    )
+                    session.add(new_user)
+
+                    # Insert record into referrals
+                    if referrer_id:
+                        referral_record = Referral(
+                            referrer_id=referrer_id,
+                            referred_id=user_id,
+                        )
+                        session.add(referral_record)
+                else:
+                    # Existing user: keep full_name synchronized
+                    if existing_user.full_name != full_name:
+                        existing_user.full_name = full_name
+    except Exception as exc:
+        logger.error("Database transaction error during /start for user %s: %s", user_id, exc)
+
+    # Send real-time Telegram notification to the referrer if valid referral was recorded
+    if referrer_to_notify and new_invites_count > 0:
+        referrer_notification = (
+            "🎉 <b>Yangi a’zo sizning havolangiz orqali kirdi!</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Qo‘shildi:</b> {safe_user_name}\n"
+            f"📊 <b>Jami to‘plagan ballaringiz:</b> {new_invites_count} ta"
+        )
+        try:
+            await bot.send_message(chat_id=referrer_to_notify, text=referrer_notification)
+            logger.info("Sent referral notification to referrer %s", referrer_to_notify)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.debug("Could not notify referrer %s: %s", referrer_to_notify, exc)
+        except Exception as exc:
+            logger.warning("Error notifying referrer %s: %s", referrer_to_notify, exc)
+
+    # Main /start UI Card
     start_text = (
         "🛡 <b>GURUH QOROVULI | XAVFSIZLIK TIZIMI</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👋 Salom, <b>{user_name}</b>!\n\n"
+        f"👋 Salom, <b>{safe_user_name}</b>!\n\n"
         "Men guruhingizni spam, arabcha botlar, reklama havolalari va behayo so‘zlardan "
         "<b>24/7</b> avtomatik tozalab turuvchi qorovulman.\n\n"
         "⚡️ <b>Imkoniyatlarim:</b>\n"
@@ -283,27 +434,49 @@ async def handle_start_private(message: Message) -> None:
         "⚖️ <i>Guruhda tartib va xotirjamlikni birga ta’minlaymiz.</i>"
     )
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Guruhga qo'shish",
-                    url=f"https://t.me/{BOT_USERNAME}?startgroup=true",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💬 Qo'llab-quvvatlash",
-                    url="https://t.me/qa_test_community",
-                )
-            ],
-        ]
-    )
-
     try:
-        await message.answer(start_text, reply_markup=keyboard)
+        await message.answer(start_text, reply_markup=get_main_keyboard())
     except TelegramBadRequest as exc:
-        logger.warning("Failed to send /start reply: %s", exc)
+        logger.warning("Failed to send /start UI card: %s", exc)
+
+
+@dp.callback_query(F.data == "my_stats")
+async def cb_my_stats(callback: CallbackQuery) -> None:
+    """Callback query for user stats."""
+    await callback.answer()
+    if callback.from_user:
+        text = await get_user_stats_text(
+            user_id=callback.from_user.id,
+            user_name=callback.from_user.full_name,
+        )
+        await callback.message.answer(text)
+
+
+@dp.callback_query(F.data == "top_referrals")
+async def cb_top_referrals(callback: CallbackQuery) -> None:
+    """Callback query for top 10 referrals leaderboard."""
+    await callback.answer()
+    text = await get_top_referrals_text()
+    await callback.message.answer(text)
+
+
+@dp.message(Command("meniki"))
+async def cmd_my_stats(message: Message) -> None:
+    """Command /meniki to view personal referral stats."""
+    if not message.from_user:
+        return
+    text = await get_user_stats_text(
+        user_id=message.from_user.id,
+        user_name=message.from_user.full_name,
+    )
+    await message.answer(text)
+
+
+@dp.message(Command("top"))
+async def cmd_top(message: Message) -> None:
+    """Command /top to view top 10 inviters."""
+    text = await get_top_referrals_text()
+    await message.answer(text)
 
 
 # ------------------ ADMIN MODERATION COMMANDS ------------------ #
@@ -353,54 +526,7 @@ async def handle_unmute_command(message: Message, bot: Bot) -> None:
         await message.reply(f"Xatolik: {exc}")
 
 
-# ------------------ MEMBERSHIP JOIN / LEAVE HANDLERS ------------------ #
-
-@dp.chat_member(
-    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-    ChatMemberUpdatedFilter(JOIN_TRANSITION),
-)
-async def handle_chat_member_joined(event: ChatMemberUpdated, bot: Bot) -> None:
-    """Listen for chat member join events."""
-    chat_title = event.chat.title or "Guruh"
-    await send_new_member_card_to_private(
-        chat_id=event.chat.id,
-        chat_title=chat_title,
-        user=event.new_chat_member.user,
-        bot_instance=bot,
-    )
-
-
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.new_chat_members)
-async def handle_new_chat_members(message: Message, bot: Bot) -> None:
-    """Handle Telegram service join messages."""
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-    if not message.new_chat_members:
-        return
-
-    chat_title = message.chat.title or "Guruh"
-    for user in message.new_chat_members:
-        await send_new_member_card_to_private(
-            chat_id=message.chat.id,
-            chat_title=chat_title,
-            user=user,
-            bot_instance=bot,
-        )
-
-
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.left_chat_member)
-async def handle_left_chat_member(message: Message) -> None:
-    """Silently delete member left service notifications."""
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-
-# ------------------ GROUP MODERATION & PROFANITY ENGINE ------------------ #
+# ------------------ 3. GROUP GUARDIAN / PROFANITY FILTER ------------------ #
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def handle_group_message(message: Message, bot: Bot) -> None:
@@ -410,10 +536,11 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
 
     # --- 1. PROFANITY & TOXICITY FILTER ENGINE ---
     if not is_user_admin and text_content and contains_profanity(text_content):
+        # 1. Delete the profane message immediately
         try:
             await message.delete()
             logger.info("Deleted profanity message in chat %s", message.chat.id)
-        except TelegramBadRequest as exc:
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.warning("Failed to delete profanity message: %s", exc)
 
         if message.from_user:
@@ -421,6 +548,7 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
             user_name = html.escape(user.full_name)
             user_id = user.id
 
+            # 2. Mute sender for 15 minutes via bot.restrict_chat_member
             mute_until = datetime.now(timezone.utc) + timedelta(minutes=15)
             restricted_permissions = ChatPermissions(
                 can_send_messages=False,
@@ -443,9 +571,10 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
                     until_date=mute_until,
                 )
                 logger.info("Muted user %s for profanity in chat %s for 15 mins", user_id, message.chat.id)
-            except TelegramBadRequest as exc:
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
                 logger.warning("Failed to restrict user %s: %s", user_id, exc)
 
+            # 3. Post alert message
             alert_text = (
                 "🔇 <b>Qoidabuzar jazolandi!</b>\n"
                 "━━━━━━━━━━━━━━━━━\n"
@@ -458,18 +587,19 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
 
             try:
                 alert_msg = await bot.send_message(chat_id=message.chat.id, text=alert_text)
+                # 4. Auto-delete this alert after 30 seconds
                 asyncio.create_task(delete_after_delay(alert_msg, 30))
-            except TelegramBadRequest as exc:
+            except (TelegramBadRequest, TelegramForbiddenError) as exc:
                 logger.warning("Failed to send profanity alert: %s", exc)
 
         return
 
-    # --- 2. ANTI-AD & 3-STRIKE LINK PROTECTION ---
+    # --- 2. ANTI-AD & LINK PROTECTION ---
     if not is_user_admin and is_ad_or_violating(message):
         try:
             await message.delete()
             logger.info("Deleted ad/link message in chat %s", message.chat.id)
-        except TelegramBadRequest as exc:
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.warning("Failed to delete ad message: %s", exc)
 
         if message.from_user:
@@ -494,7 +624,7 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
                         f"<b>24 soatga</b> guruhda yozish huquqidan mahrum qilindi (MUTE)!"
                     )
                     await bot.send_message(chat_id=message.chat.id, text=punish_text)
-                except TelegramBadRequest as exc:
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
                     logger.warning("Failed to restrict user: %s", exc)
             else:
                 _user_warnings[warn_key] = current_warns
@@ -505,7 +635,7 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
                 )
                 try:
                     await bot.send_message(chat_id=message.chat.id, text=warn_text)
-                except TelegramBadRequest as exc:
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
                     logger.warning("Failed to send link warning: %s", exc)
 
         return
@@ -513,19 +643,42 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
     # --- 3. AUTO-REACTION FOR VALID MESSAGES ---
     try:
         await message.react([ReactionTypeEmoji(emoji="❤️")])
-    except (TelegramBadRequest, Exception) as exc:
-        logger.debug("Failed to react: %s", exc)
+    except Exception as exc:
+        logger.debug("Auto-reaction skipped: %s", exc)
+
+
+# ------------------ MEMBERSHIP SERVICE HANDLERS ------------------ #
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.new_chat_members)
+async def handle_new_chat_members(message: Message) -> None:
+    """Handle and clean Telegram join service messages."""
+    try:
+        await message.delete()
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.left_chat_member)
+async def handle_left_chat_member(message: Message) -> None:
+    """Silently delete member left service notifications."""
+    try:
+        await message.delete()
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
 
 
 # ------------------ BOT ENTRYPOINT ------------------ #
 
 async def main() -> None:
-    """Main polling runner."""
-    logger.info("Starting Telegram Group Guardian Bot...")
+    """Main application runner."""
+    logger.info("Initializing database...")
+    await init_db()
+
+    logger.info("Starting Telegram Group Guardian & Referral Counter Bot...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "edited_message", "chat_member", "my_chat_member"],
+        allowed_updates=["message", "edited_message", "callback_query", "chat_member", "my_chat_member"],
     )
 
 
