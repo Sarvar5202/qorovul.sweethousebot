@@ -100,16 +100,36 @@ class Referral(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), default=func.now())
 
 
+class ScheduledDeletion(Base):
+    """Persisted scheduled message deletion queue that survives bot restarts."""
+    __tablename__ = "scheduled_deletions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), default=func.now())
+
+
 # Async Engine & SessionMaker
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
 async def init_db() -> None:
-    """Initialize database tables on startup."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables initialized successfully on %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL)
+    """Initialize database tables on startup with fallback support."""
+    global engine, async_session
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables initialized successfully on %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL)
+    except Exception as exc:
+        logger.warning("Could not connect to configured DATABASE_URL (%s). Falling back to local SQLite database: %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL, exc)
+        engine = create_async_engine("sqlite+aiosqlite:///bot.db", echo=False)
+        async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Local SQLite database tables initialized successfully.")
 
 
 # ------------------ BOT INITIALIZATION ------------------ #
@@ -157,6 +177,7 @@ HOMOGLYPHS = {
     "@": "a", "0": "o", "1": "i", "!": "i", "$": "s", "3": "e", "4": "a"
 }
 
+_recent_welcomes: dict[int, float] = {}
 _registered_admins: set[int] = set()
 
 if ENV_ADMIN_ID and ENV_ADMIN_ID.isdigit():
@@ -394,6 +415,100 @@ async def get_top_referrals_text() -> str:
     return "\n".join(lines)
 
 
+# ------------------ FEATURE 2: PRIVATE NEW MEMBER NOTIFICATIONS ------------------ #
+
+async def send_private_join_notification(chat_title: str, user: TgUser, bot_instance: Bot) -> None:
+    """Send private DM notification about new member exclusively to bot owner/admin(s)."""
+    if user.is_bot:
+        return
+
+    now = time.time()
+    for key, ts in list(_recent_welcomes.items()):
+        if now - ts > 60:
+            _recent_welcomes.pop(key, None)
+
+    cache_key = user.id
+    if cache_key in _recent_welcomes and (now - _recent_welcomes[cache_key]) < 30:
+        return
+    _recent_welcomes[cache_key] = now
+
+    safe_name = html.escape(user.full_name)
+    username_str = f"@{user.username}" if user.username else "Mavjud emas"
+    safe_title = html.escape(chat_title or "Guruh")
+    join_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    join_card_text = (
+        "🔔 <b>Yangi a'zo qo'shildi!</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Guruh:</b> {safe_title}\n"
+        f"👤 <b>Foydalanuvchi:</b> <a href=\"tg://user?id={user.id}\">{safe_name}</a>\n"
+        f"🔗 <b>Username:</b> {username_str}\n"
+        f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+        f"📅 <b>Vaqt:</b> {join_time_str}"
+    )
+
+    recipients = set(_registered_admins)
+    if ENV_ADMIN_ID and ENV_ADMIN_ID.isdigit():
+        recipients.add(int(ENV_ADMIN_ID))
+
+    for admin_id in recipients:
+        try:
+            await bot_instance.send_message(chat_id=admin_id, text=join_card_text)
+            logger.info("Sent private join notification for user %s to admin %s", user.id, admin_id)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.debug("Could not send private notification to admin %s: %s", admin_id, exc)
+        except Exception as exc:
+            logger.warning("Error sending private notification to admin %s: %s", admin_id, exc)
+
+
+# ------------------ FEATURE 1: SCHEDULED DELETION WORKER (15-HOUR TIMER) ------------------ #
+
+async def scheduled_deletion_worker(bot_instance: Bot) -> None:
+    """Background worker that continuously polls and deletes scheduled warning messages after 15 hours."""
+    logger.info("Starting scheduled message deletion background worker (15h timer)...")
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            async with async_session() as session:
+                result = await session.execute(
+                    select(ScheduledDeletion).where(ScheduledDeletion.scheduled_at <= now_utc)
+                )
+                due_deletions = result.scalars().all()
+
+                for deletion in due_deletions:
+                    try:
+                        await bot_instance.delete_message(
+                            chat_id=deletion.chat_id,
+                            message_id=deletion.message_id,
+                        )
+                        logger.info(
+                            "AUTO-DELETE EXECUTED: Successfully deleted warning message %s in chat %s after 15h timer.",
+                            deletion.message_id,
+                            deletion.chat_id,
+                        )
+                    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                        logger.debug(
+                            "Message %s in chat %s was already deleted or not found: %s",
+                            deletion.message_id,
+                            deletion.chat_id,
+                            exc,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Error deleting scheduled message %s in chat %s: %s",
+                            deletion.message_id,
+                            deletion.chat_id,
+                            exc,
+                        )
+                    await session.delete(deletion)
+                if due_deletions:
+                    await session.commit()
+        except Exception as exc:
+            logger.error("Error in scheduled deletion worker loop: %s", exc)
+
+        await asyncio.sleep(20)
+
+
 # ------------------ SANOQCHI / REFERRAL SYSTEM (PRIVATE CHAT) ------------------ #
 
 @dp.message(F.chat.type == ChatType.PRIVATE, CommandStart())
@@ -579,6 +694,7 @@ async def cb_delete_guard_msg(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
     admin_id = callback.from_user.id
 
     # Security check: verify admin status
@@ -589,9 +705,20 @@ async def cb_delete_guard_msg(callback: CallbackQuery, bot: Bot) -> None:
     try:
         await callback.message.delete()
         await callback.answer()
+        # Remove from scheduled_deletions table if present
+        async with async_session() as session:
+            async with session.begin():
+                await session.execute(
+                    ScheduledDeletion.__table__.delete().where(
+                        ScheduledDeletion.chat_id == chat_id,
+                        ScheduledDeletion.message_id == message_id,
+                    )
+                )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         logger.debug("Failed to delete guard message: %s", exc)
         await callback.answer("Xabarni o'chirib bo'lmadi.", show_alert=False)
+    except Exception as exc:
+        logger.warning("Error in cb_delete_guard_msg: %s", exc)
 
 
 # ------------------ ADMIN MODERATION COMMANDS ------------------ #
@@ -711,37 +838,64 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
 
         return
 
-    # --- 2. ADVANCED ANTI-LINK & ANTI-ADVERTISEMENT ENGINE ---
+    # --- 2. ADVANCED ANTI-LINK & ANTI-ADVERTISEMENT ENGINE (FEATURE 1) ---
     if is_ad_or_violating(message):
+        orig_msg_id = message.message_id
+        chat_id = message.chat.id
+        user_id = message.from_user.id if message.from_user else 0
+        user_full_name = message.from_user.full_name if message.from_user else "Foydalanuvchi"
+        safe_user_name = html.escape(user_full_name)
+
         # Step 1: Immediately delete the offending advertisement message
         try:
             await message.delete()
-            logger.info("Deleted ad/link message from user %s in chat %s", message.from_user.id if message.from_user else "unknown", message.chat.id)
+            logger.info("Deleted ad message (ID: %s) from user %s in chat %s", orig_msg_id, user_id, chat_id)
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            logger.warning("Failed to delete ad message: %s", exc)
+            logger.warning("Failed to delete ad message (ID: %s): %s", orig_msg_id, exc)
 
         if message.from_user:
-            user = message.from_user
-            user_id = user.id
-            user_full_name = html.escape(user.full_name)
-
             # Step 2: Dedicated warning message tagging the offender
             warning_text = (
-                f"⚠️ <b>Hurmatli <a href=\"tg://user?id={user_id}\">{user_full_name}</a>, guruhda reklama tarqatmang!</b>\n"
+                f"⚠️ <b>Hurmatli <a href=\"tg://user?id={user_id}\">{safe_user_name}</a>, guruhda reklama tarqatmang!</b>\n"
                 "━━━━━━━━━━━━━━━━━\n"
                 "🚫 Reklama, havola va kanallar targ'iboti taqiqlangan.\n"
                 "⚖️ Qoidalarni takroran buzsangiz, guruhdan butunlay chetlatilasiz!"
             )
 
             # Step 3: Attach Inline Keyboard with admin action buttons
+            warning_msg = None
             try:
-                await bot.send_message(
-                    chat_id=message.chat.id,
+                warning_msg = await bot.send_message(
+                    chat_id=chat_id,
                     text=warning_text,
                     reply_markup=get_ad_warning_keyboard(user_id),
                 )
             except (TelegramBadRequest, TelegramForbiddenError) as exc:
                 logger.warning("Failed to send ad warning message: %s", exc)
+
+            if warning_msg:
+                # Exactly 15 hours (54,000 seconds) self-destruct timer
+                scheduled_delete_at = datetime.now(timezone.utc) + timedelta(hours=15)
+                try:
+                    async with async_session() as session:
+                        async with session.begin():
+                            record = ScheduledDeletion(
+                                chat_id=chat_id,
+                                message_id=warning_msg.message_id,
+                                scheduled_at=scheduled_delete_at.replace(tzinfo=None),
+                            )
+                            session.add(record)
+                    logger.info(
+                        "AUDIT LOG: Ad detected & processed | ChatID=%s | UserID=%s (%s) | OrigMsgID=%s | WarningMsgID=%s | ScheduledDeleteAt=%s",
+                        chat_id,
+                        user_id,
+                        user_full_name,
+                        orig_msg_id,
+                        warning_msg.message_id,
+                        scheduled_delete_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    )
+                except Exception as exc:
+                    logger.error("Failed to persist scheduled deletion to database: %s", exc)
 
         return
 
@@ -752,15 +906,40 @@ async def handle_group_message(message: Message, bot: Bot) -> None:
         logger.debug("Auto-reaction skipped: %s", exc)
 
 
-# ------------------ MEMBERSHIP SERVICE HANDLERS ------------------ #
+# ------------------ MEMBERSHIP SERVICE HANDLERS (FEATURE 2) ------------------ #
+
+@dp.chat_member(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    ChatMemberUpdatedFilter(JOIN_TRANSITION),
+)
+async def handle_chat_member_joined(event: ChatMemberUpdated, bot: Bot) -> None:
+    """Listen for chat member join events and send private DM to admin only."""
+    chat_title = event.chat.title or "Guruh"
+    await send_private_join_notification(
+        chat_title=chat_title,
+        user=event.new_chat_member.user,
+        bot_instance=bot,
+    )
+
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.new_chat_members)
-async def handle_new_chat_members(message: Message) -> None:
-    """Handle and clean Telegram join service messages."""
+async def handle_new_chat_members(message: Message, bot: Bot) -> None:
+    """Silently delete Telegram group join service notifications and send private DM to admin."""
     try:
         await message.delete()
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
+
+    if not message.new_chat_members:
+        return
+
+    chat_title = message.chat.title or "Guruh"
+    for user in message.new_chat_members:
+        await send_private_join_notification(
+            chat_title=chat_title,
+            user=user,
+            bot_instance=bot,
+        )
 
 
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.left_chat_member)
@@ -778,6 +957,9 @@ async def main() -> None:
     """Main application runner."""
     logger.info("Initializing database...")
     await init_db()
+
+    # Launch background worker for scheduled 15-hour message deletions across restarts
+    asyncio.create_task(scheduled_deletion_worker(bot))
 
     logger.info("Starting Telegram Group Guardian & Referral Counter Bot...")
     await bot.delete_webhook(drop_pending_updates=True)
